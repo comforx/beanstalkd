@@ -1,0 +1,16 @@
+>:use abc
+<:USING abc
+>:put 999999 0 0 0
+>:
+<:INSERTED 1
+>:use def
+<:USING def
+>:put 99 0 0 0
+>:
+<:INSERTED 2
+>:watch abc
+<:WATCHING 2
+>:watch def
+<:WATCHING 3
+>:reserve
+<:RESERVED 2 0

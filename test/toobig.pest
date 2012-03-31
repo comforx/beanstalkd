@@ -1,0 +1,6 @@
+>:put 0 0 0 11
+>:delete 9999
+>:put 0 0 0 1
+>:x
+<:JOB_TOO_BIG
+<:INSERTED {.}

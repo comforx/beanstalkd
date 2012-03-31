@@ -1,0 +1,6 @@
+>:put 0 0 5 1
+>:a
+<:INSERTED 1
+>:stats-job 1
+<:OK 143
+<:{.}time-left: 0{"\n"^.}

@@ -21,7 +21,7 @@ typedef struct Heap   Heap;
 typedef struct Jobrec Jobrec;
 typedef struct File   File;
 typedef struct Socket Socket;
-typedef struct Srv    Srv;
+typedef struct Server Server;
 typedef struct Wal    Wal;
 
 typedef void(*evh)(int, short, void *);
@@ -60,6 +60,7 @@ typedef void(*Record)(void*, int);
 
 extern const char version[];
 extern int verbose;
+extern struct Server srv;
 
 struct stats {
     uint urgent_ct;
@@ -167,7 +168,7 @@ struct tube {
 
 struct conn {
     conn prev, next; /* linked list of connections */
-    Srv *srv;
+    Server *srv;
     Socket sock;
     char state;
     char type;
@@ -214,7 +215,7 @@ void warnx(const char *fmt, ...);
 char* fmtalloc(char *fmt, ...);
 void* zalloc(int n);
 #define new(T) zalloc(sizeof(T))
-void optparse(Srv*, char**);
+void optparse(Server*, char**);
 
 extern const char *progname;
 
@@ -303,16 +304,16 @@ extern size_t primes[];
 extern size_t job_data_size_limit;
 
 void prot_init(void);
-void prottick(Srv *s);
+void prottick(Server *s);
 
 conn remove_waiting_conn(conn c);
 
 void enqueue_reserved_jobs(conn c);
 
 void enter_drain_mode(int sig);
-void h_accept(const int fd, const short which, Srv* srv);
+void h_accept(const int fd, const short which, Server* srv);
 void prot_remove_tube(tube t);
-void prot_replay(Srv *s, job list);
+void prot_replay(Server *s, job list);
 
 
 int make_server_socket(char *host_addr, char *port);
@@ -324,6 +325,7 @@ enum
 };
 
 struct Wal {
+    int    filesz;
     int    use;
     char   *dir;
     File   *head;
@@ -331,7 +333,6 @@ struct Wal {
     File   *tail;
     int    nfile;
     int    next;
-    int    filesz;
     int    resv;  // bytes reserved
     int    alive; // bytes in use
     int64  nmig;  // migrations
@@ -378,16 +379,16 @@ int  filewrjobfull(File*, job);
 
 #define Portdef "11300"
 
-struct Srv {
-    Socket sock;
-    Heap   conns;
-    Wal    wal;
-
+struct Server {
     char *port;
     char *addr;
     char *user;
+
+    Wal    wal;
+    Socket sock;
+    Heap   conns;
 };
-void srv(Srv *srv);
-void srvaccept(Srv *s, int ev);
-void srvschedconn(Srv *srv, conn c);
-void srvtick(Srv *s, int ev);
+void srvserve(Server *srv);
+void srvaccept(Server *s, int ev);
+void srvschedconn(Server *srv, conn c);
+void srvtick(Server *s, int ev);

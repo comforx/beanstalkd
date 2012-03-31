@@ -16,116 +16,163 @@
 #include "ct/ct.h"
 #include "dat.h"
 
-static void testsrv(char*, char*, int);
-static void forksrv(int*, int*);
-static int copy(int, int, int);
-static int diff(char*, int);
-static int diallocal(int);
-static void cleanup(int sig);
 static void mustsend(int fd, char* cmd);
-static void ckresp(int fd, char* exp);
-static void writefull(int fd, char *s, int n);
-static void readfull(int fd, char *b, int n);
-
-typedef struct T T;
-struct T {
-    char *cmd;
-    char *exp;
-};
-
-static T ts[] = {
-    {"sh-tests/allow-underscore.commands", "sh-tests/allow-underscore.expected"},
-    {"sh-tests/delete_ready.commands", "sh-tests/delete_ready.expected"},
-    {"sh-tests/multi-tube.commands", "sh-tests/multi-tube.expected"},
-    {"sh-tests/no_negative_delays.commands", "sh-tests/no_negative_delays.expected"},
-    {"sh-tests/omit-time-left.commands", "sh-tests/omit-time-left.expected"},
-    {"sh-tests/pause-tube.commands", "sh-tests/pause-tube.expected"},
-    {"sh-tests/small_delay.commands", "sh-tests/small_delay.expected"},
-    {"sh-tests/stats_tube.commands", "sh-tests/stats_tube.expected"},
-    {"sh-tests/too-big.commands", "sh-tests/too-big.expected"},
-    {"sh-tests/ttr-large.commands", "sh-tests/ttr-large.expected"},
-    {"sh-tests/ttr-small.commands", "sh-tests/ttr-small.expected"},
-    {"sh-tests/zero_delay.commands", "sh-tests/zero_delay.expected"},
-    {},
-};
 
 static int srvpid;
-static int timeout = 100*1000000; // 100ms
+static int timeout = 500000000; // 500ms
 
 
-void
-cttestsrv()
+static int
+mustdiallocal(int port)
 {
-    int i;
+    int r, fd;
+    struct sockaddr_in addr = {};
 
-    for (i = 0; ts[i].cmd; i++) {
-        testsrv(ts[i].cmd, ts[i].exp, 4096);
-        testsrv(ts[i].cmd, ts[i].exp, 1);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    r = inet_aton("127.0.0.1", &addr.sin_addr);
+    if (!r) {
+        errno = EINVAL;
+        twarn("inet_aton");
+        exit(1);
     }
+
+    fd = socket(PF_INET, SOCK_STREAM, 0);
+    if (fd == -1) {
+        twarn("socket");
+        exit(1);
+    }
+
+    r = connect(fd, (struct sockaddr*)&addr, sizeof addr);
+    if (r == -1) {
+        twarn("connect");
+        exit(1);
+    }
+
+    return fd;
+}
+
+
+#define SERVER() (progname=__func__, mustforksrv())
+
+static int
+mustforksrv()
+{
+    int r, len, port;
+    struct sockaddr_in addr;
+
+    srv.sock.fd = make_server_socket("127.0.0.1", "0");
+    if (srv.sock.fd == -1) {
+        puts("mustforksrv failed");
+        exit(1);
+    }
+
+    len = sizeof(addr);
+    r = getsockname(srv.sock.fd, (struct sockaddr*)&addr, (socklen_t*)&len);
+    if (r == -1 || len > sizeof(addr)) {
+        puts("mustforksrv failed");
+        exit(1);
+    }
+
+    port = ntohs(addr.sin_port);
+    srvpid = fork();
+    if (srvpid != 0) {
+        return port;
+    }
+
+    /* now in child */
+
+    prot_init();
+
+    if (srv.wal.use) {
+        struct job list = {};
+        // We want to make sure that only one beanstalkd tries
+        // to use the wal directory at a time. So acquire a lock
+        // now and never release it.
+        if (!waldirlock(&srv.wal)) {
+            twarnx("failed to lock wal dir %s", srv.wal.dir);
+            exit(10);
+        }
+
+        list.prev = list.next = &list;
+        walinit(&srv.wal, &list);
+        prot_replay(&srv, &list);
+    }
+
+    srvserve(&srv); /* does not return */
+    exit(1); /* satisfy the compiler */
+}
+
+
+static char *
+readline(int fd)
+{
+    int r, c = 0, p = 0, i = 0;
+    static char buf[1024];
+    fd_set rfd;
+    struct timeval tv;
+
+    printf("<%d ", fd);
+    fflush(stdout);
+    for (;;) {
+        FD_ZERO(&rfd);
+        FD_SET(fd, &rfd);
+        tv.tv_sec = timeout / 1000000000;
+        tv.tv_usec = (timeout/1000) % 1000000;
+        r = select(fd+1, &rfd, NULL, NULL, &tv);
+        switch (r) {
+        case 1:
+            break;
+        case 0:
+            fputs("timeout", stderr);
+            exit(8);
+        case -1:
+            perror("select");
+            exit(1);
+        default:
+            fputs("unknown error", stderr);
+            exit(3);
+        }
+
+        r = read(fd, &c, 1);
+        if (r == -1) {
+            perror("write");
+            exit(1);
+        }
+        if (i >= sizeof(buf)-1) {
+            fputs("response too big", stderr);
+            exit(4);
+        }
+        putc(c, stdout);
+        fflush(stdout);
+        buf[i++] = c;
+        if (p == '\r' && c == '\n') {
+            break;
+        }
+        p = c;
+    }
+    buf[i] = '\0';
+    return buf;
 }
 
 
 static void
-testsrv(char *cmd, char *exp, int bufsiz)
+ckresp(int fd, char *exp)
 {
-    int diffst, srvst, port = 0, cfd, tfd, diffpid;
-    struct sigaction sa = {};
+    char *line;
 
-    job_data_size_limit = 10;
+    line = readline(fd);
+    assertf(strcmp(exp, line) == 0, "\"%s\" != \"%s\"", exp, line);
+}
 
-    progname = cmd;
-    puts(cmd);
-    forksrv(&port, &srvpid);
-    if (port == -1 || srvpid == -1) {
-        puts("forksrv failed");
-        exit(1);
-    }
 
-    // Fail if this test takes more than 10 seconds.
-    // If we have trouble installing the timeout,
-    // just proceed anyway.
-    sa.sa_handler = cleanup;
-    sigaction(SIGALRM, &sa, 0);
-    alarm(10);
+static void
+ckrespsub(int fd, char *sub)
+{
+    char *line;
 
-    cfd = diallocal(port);
-    if (cfd == -1) {
-        twarn("diallocal");
-        kill(srvpid, 9);
-        exit(1);
-    }
-
-    tfd = open(cmd, O_RDONLY, 0);
-    if (tfd == -1) {
-        twarn("open");
-        kill(srvpid, 9);
-        exit(1);
-    }
-
-    if (copy(cfd, tfd, bufsiz) == -1) {
-        twarn("copy");
-        kill(srvpid, 9);
-        exit(1);
-    }
-
-    diffpid = diff(exp, cfd);
-    if (diffpid == -1) {
-        twarn("diff");
-        kill(srvpid, 9);
-        exit(1);
-    }
-
-    waitpid(diffpid, &diffst, 0);
-
-    // wait until after diff has finished to kill srvpid
-    kill(srvpid, 9);
-    waitpid(srvpid, &srvst, 0);
-    assertf(WIFSIGNALED(srvst) && WTERMSIG(srvst) == 9,
-            "status %d, signal %d",
-            WEXITSTATUS(srvst),
-            WTERMSIG(srvst));
-
-    assertf(diffst == 0, "was %d", diffst);
+    line = readline(fd);
+    assertf(strstr(line, sub), "\"%s\" not in \"%s\"", sub, line);
 }
 
 
@@ -138,164 +185,361 @@ killsrv(void)
 }
 
 
+static int
+filesize(char *path)
+{
+    int r;
+    struct stat s;
+
+    r = stat(path, &s);
+    if (r == -1) {
+        twarn("stat");
+        exit(1);
+    }
+    return s.st_size;
+}
+
+
+static int
+exist(char *path)
+{
+    int r;
+    struct stat s;
+
+    r = stat(path, &s);
+    return r != -1;
+}
+
+
+static void
+pest(char *path)
+{
+    int port;
+    char cmd[100];
+
+    port = SERVER();
+
+    sprintf(cmd, "exec pest localhost:%d %s", port, path);
+    assert(system(cmd) == 0);
+    killsrv();
+}
+
+
+void
+cttestpause()
+{
+    int port, fd;
+    int64 s;
+
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "put 0 0 0 1\r\n");
+    mustsend(fd, "x\r\n");
+    ckresp(fd, "INSERTED 1\r\n");
+    s = nanoseconds();
+    mustsend(fd, "pause-tube default 1\r\n");
+    ckresp(fd, "PAUSED\r\n");
+    timeout = 1100000000; // 1.1s
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 1 1\r\n");
+    ckresp(fd, "x\r\n");
+    assert(nanoseconds() - s >= 1000000000); // 1s
+
+    killsrv();
+}
+
+
+void
+cttestunderscore()
+{
+    pest("test/underscore.pest");
+}
+
+
+void
+cttesttoobig()
+{
+    job_data_size_limit = 10;
+    pest("test/toobig.pest");
+}
+
+
+void
+cttestdeleteready()
+{
+    pest("test/delete-ready.pest");
+}
+
+
+void
+cttestmultitube()
+{
+    pest("test/multi-tube.pest");
+}
+
+
+void
+cttestnonegativedelay()
+{
+    pest("test/no-negative-delay.pest");
+}
+
+
+void
+cttestnoomittimeleft()
+{
+    pest("test/omit-time-left.pest");
+}
+
+
+void
+cttestsmalldelay()
+{
+    pest("test/small-delay.pest");
+}
+
+
+void
+ctteststatstube()
+{
+    pest("test/stats-tube.pest");
+}
+
+
+void
+cttestttrlarge()
+{
+    int port, fd;
+
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "put 0 0 120 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 1\r\n");
+    mustsend(fd, "put 0 0 4294 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 2\r\n");
+    mustsend(fd, "put 0 0 4295 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 3\r\n");
+    mustsend(fd, "put 0 0 4296 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 4\r\n");
+    mustsend(fd, "put 0 0 4297 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 5\r\n");
+    mustsend(fd, "put 0 0 5000 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 6\r\n");
+    mustsend(fd, "put 0 0 21600 1\r\n");
+    mustsend(fd, "a\r\n");
+    ckresp(fd, "INSERTED 7\r\n");
+    mustsend(fd, "stats-job 1\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 120\n");
+    mustsend(fd, "stats-job 2\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 4294\n");
+    mustsend(fd, "stats-job 3\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 4295\n");
+    mustsend(fd, "stats-job 4\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 4296\n");
+    mustsend(fd, "stats-job 5\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 4297\n");
+    mustsend(fd, "stats-job 6\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 5000\n");
+    mustsend(fd, "stats-job 7\r\n");
+    ckrespsub(fd, "OK ");
+    ckrespsub(fd, "\nttr: 21600\n");
+
+    killsrv();
+}
+
+
+void
+cttestttrsmall()
+{
+    pest("test/ttr-small.pest");
+}
+
+
+void
+cttestzerodelay()
+{
+    pest("test/zero-delay.pest");
+}
+
+
 void
 cttestreservewithtimeout2conn()
 {
-    int port = 0, cfd0, cfd1;
-    struct sigaction sa = {};
+    int port, fd0, fd1;
 
     job_data_size_limit = 10;
 
-    progname = __func__;
-    forksrv(&port, &srvpid);
-    if (port == -1 || srvpid == -1) {
-        puts("forksrv failed");
-        exit(1);
-    }
-
-    atexit(killsrv);
-
-    // Fail if this test takes more than 10 seconds.
-    // If we have trouble installing the timeout,
-    // just proceed anyway.
-    sa.sa_handler = cleanup;
-    sigaction(SIGALRM, &sa, 0);
-    alarm(10);
-
-    cfd0 = diallocal(port);
-    if (cfd0 == -1) {
-        twarn("diallocal");
-        exit(1);
-    }
-
-    cfd1 = diallocal(port);
-    if (cfd1 == -1) {
-        twarn("diallocal");
-        exit(1);
-    }
-
-    mustsend(cfd0, "watch foo\r\n");
-    ckresp(cfd0, "WATCHING 2\r\n");
-    mustsend(cfd0, "reserve-with-timeout 1\r\n");
-    mustsend(cfd1, "watch foo\r\n");
-    ckresp(cfd1, "WATCHING 2\r\n");
+    port = SERVER();
+    fd0 = mustdiallocal(port);
+    fd1 = mustdiallocal(port);
+    mustsend(fd0, "watch foo\r\n");
+    ckresp(fd0, "WATCHING 2\r\n");
+    mustsend(fd0, "reserve-with-timeout 1\r\n");
+    mustsend(fd1, "watch foo\r\n");
+    ckresp(fd1, "WATCHING 2\r\n");
     timeout = 1100000000; // 1.1s
-    ckresp(cfd0, "TIMED_OUT\r\n");
+    ckresp(fd0, "TIMED_OUT\r\n");
+
+    killsrv();
 }
 
 
-static void
-forksrv(int *port, int *pid)
+void
+cttestbinlogemptyexit()
 {
-    int r, len;
-    Srv s = {};
-    struct sockaddr_in addr;
+    int port, fd;
+    char dir[] = "/tmp/beanstalkd.test.XXXXXX";
 
-    s.sock.fd = make_server_socket("127.0.0.1", "0");
-    if (s.sock.fd == -1) return;
+    mkdtemp(dir);
+    srv.wal.dir = dir;
+    srv.wal.use = 1;
+    job_data_size_limit = 10;
 
-    len = sizeof(addr);
-    r = getsockname(s.sock.fd, (struct sockaddr*)&addr, (socklen_t*)&len);
-    if (r == -1 || len > sizeof(addr)) return;
+    port = SERVER();
 
-    *port = addr.sin_port;
+    killsrv();
 
-    *pid = fork();
-    if (*pid != 0) return;
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "put 0 0 0 0\r\n");
+    mustsend(fd, "\r\n");
+    ckresp(fd, "INSERTED 1\r\n");
 
-    /* now in child */
-
-    prot_init();
-
-    srv(&s); /* does not return */
-    exit(1); /* satisfy the compiler */
+    killsrv();
+    execlp("rm", "rm", "-rf", dir, NULL);
 }
 
 
-static int
-diff(char *f0, int fd)
+void
+cttestbinlogbury()
 {
-    int pid;
+    int port, fd;
+    char dir[] = "/tmp/beanstalkd.test.XXXXXX";
 
-    pid = fork();
-    if (pid != 0) return pid;
+    mkdtemp(dir);
+    srv.wal.dir = dir;
+    srv.wal.use = 1;
+    job_data_size_limit = 10;
 
-    /* now in child */
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "put 0 0 100 0\r\n");
+    mustsend(fd, "\r\n");
+    ckresp(fd, "INSERTED 1\r\n");
+    mustsend(fd, "reserve\r\n");
+    ckresp(fd, "RESERVED 1 0\r\n");
+    ckresp(fd, "\r\n");
+    mustsend(fd, "bury 1 0\r\n");
+    ckresp(fd, "BURIED\r\n");
 
-    dup2(fd, 0);
-    close(fd);
-
-    execlp("diff", "diff", f0, "-", (char*)0);
-    /* not reached */
-    exit(1);
+    killsrv();
+    execlp("rm", "rm", "-rf", dir, NULL);
 }
 
 
-static int
-copy(int dst, int src, int bs)
+void
+cttestbinlogbasic()
 {
-    char buf[bs];
-    int r, w, c;
+    int port, fd;
+    char dir[] = "/tmp/beanstalkd.test.XXXXXX";
 
-    for (;;) {
-        r = read(src, buf, sizeof buf);
-        if (r == -1) return -1;
-        if (r == 0) break;
+    mkdtemp(dir);
+    srv.wal.dir = dir;
+    srv.wal.use = 1;
+    job_data_size_limit = 10;
 
-        for (w = 0; w < r; w += c) {
-            c = write(dst, buf+w, r-w);
-            if (c == -1) return -1;
-        }
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "put 0 0 100 0\r\n");
+    mustsend(fd, "\r\n");
+    ckresp(fd, "INSERTED 1\r\n");
+
+    killsrv();
+    waitpid(srvpid, NULL, 0);
+
+    port = SERVER();
+    fd = mustdiallocal(port);
+    mustsend(fd, "delete 1\r\n");
+    ckresp(fd, "DELETED\r\n");
+
+    killsrv();
+    execlp("rm", "rm", "-rf", dir, NULL);
+}
+
+
+void
+cttestbinlogsizelimit()
+{
+    int port, fd, i = 0;
+    char dir[] = "/tmp/beanstalkd.test.XXXXXX", *b2;
+    int size = 1024, gotsize;
+
+    mkdtemp(dir);
+    srv.wal.dir = dir;
+    srv.wal.use = 1;
+    srv.wal.filesz = size;
+    srv.wal.syncrate = 0;
+    srv.wal.wantsync = 1;
+
+    port = SERVER();
+    fd = mustdiallocal(port);
+    b2 = fmtalloc("%s/binlog.2", dir);
+    while (!exist(b2)) {
+        mustsend(fd, "put 0 0 100 50\r\n");
+        mustsend(fd, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n");
+        ckresp(fd, fmtalloc("INSERTED %d\r\n", ++i));
     }
-    return 0;
+
+    gotsize = filesize(fmtalloc("%s/binlog.1", dir));
+    assertf(gotsize == size, "binlog.1 %d != %d", gotsize, size);
+    gotsize = filesize(b2);
+    assertf(gotsize == size, "binlog.2 %d != %d", gotsize, size);
+
+    killsrv();
+    execlp("rm", "rm", "-rf", dir, NULL);
 }
 
 
-static int
-diallocal(int port)
+void
+cttestbinlogallocation()
 {
-    int r, fd;
-    struct sockaddr_in addr = {};
+    int port, fd, i = 0;
+    char dir[] = "/tmp/beanstalkd.test.XXXXXX";
+    int size = 601;
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = port;
-    r = inet_aton("127.0.0.1", &addr.sin_addr);
-    if (!r) {
-        errno = EINVAL;
-        return -1;
+    mkdtemp(dir);
+    srv.wal.dir = dir;
+    srv.wal.use = 1;
+    srv.wal.filesz = size;
+    srv.wal.syncrate = 0;
+    srv.wal.wantsync = 1;
+
+    port = SERVER();
+    fd = mustdiallocal(port);
+    for (i = 1; i <= 96; i++) {
+        mustsend(fd, "put 0 0 120 22\r\n");
+        mustsend(fd, "job payload xxxxxxxxxx\r\n");
+        ckresp(fd, fmtalloc("INSERTED %d\r\n", i));
+    }
+    for (i = 1; i <= 96; i++) {
+        mustsend(fd, fmtalloc("delete %d\r\n", i));
+        ckresp(fd, "DELETED\r\n");
     }
 
-    fd = socket(PF_INET, SOCK_STREAM, 0);
-    if (fd == -1) {
-        return -1;
-    }
-
-    r = connect(fd, (struct sockaddr*)&addr, sizeof addr);
-    if (r == -1) {
-        return -1;
-    }
-
-    return fd;
-}
-
-
-static void
-cleanup(int sig)
-{
-    puts("timed out");
-    if (srvpid > 0) {
-        kill(srvpid, 9);
-    }
-    exit(1);
-}
-
-
-static void
-mustsend(int fd, char *s)
-{
-    writefull(fd, s, strlen(s));
-    printf(">%d %s", fd, s);
-    fflush(stdout);
+    killsrv();
+    execlp("rm", "rm", "-rf", dir, NULL);
 }
 
 
@@ -315,53 +559,9 @@ writefull(int fd, char *s, int n)
 
 
 static void
-readfull(int fd, char *b, int n)
+mustsend(int fd, char *s)
 {
-    int r;
-    fd_set rfd;
-    struct timeval tv;
-
-    for (; n; n -= r) {
-        FD_ZERO(&rfd);
-        FD_SET(fd, &rfd);
-        tv.tv_sec = timeout / 1000000000;
-        tv.tv_usec = (timeout/1000) % 1000000;
-        r = select(fd+1, &rfd, (void*)0, (void*)0, &tv);
-        switch (r) {
-        case 1:
-            break;
-        case 0:
-            fputs("timeout", stderr);
-            exit(8);
-        case -1:
-            perror("select");
-            exit(1);
-        default:
-            fputs("unknown error", stderr);
-            exit(3);
-        }
-
-        r = read(fd, b, n);
-        if (r == -1) {
-            perror("write");
-            exit(1);
-        }
-        b += r;
-    }
-}
-
-
-static void
-ckresp(int fd, char *exp)
-{
-    printf("<%d ", fd);
+    writefull(fd, s, strlen(s));
+    printf(">%d %s", fd, s);
     fflush(stdout);
-    char c;
-    while (*exp) {
-        readfull(fd, &c, 1);
-        assert(c == *exp);
-        putc(c, stdout);
-        fflush(stdout);
-        exp++;
-    }
 }

@@ -1,0 +1,6 @@
+>:put 0 0 0 1
+>:a
+<:INSERTED 1
+>:stats-job 1
+<:OK {.}
+<:{.^"\n"}ttr: 1{"\n"^.}
